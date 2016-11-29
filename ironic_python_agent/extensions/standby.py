@@ -14,9 +14,14 @@
 
 import hashlib
 import os
-import time
 
 from ironic_lib import disk_utils
+import requests
+import six
+import stat
+import time
+
+import bcoding
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
@@ -34,13 +39,21 @@ LOG = log.getLogger(__name__)
 IMAGE_CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
-def _image_location(image_info):
+def _configdrive_location():
+    """Get the configdrive location in the local file system.
+
+    :returns: The full, absolute path to the configdrive as a string.
+    """
+    return '/tmp/configdrive'
+
+
+def _image_location(image_info, prefix=''):
     """Get the location of the image in the local file system.
 
     :param image_info: Image information dictionary.
     :returns: The full, absolute path to the image as a string.
     """
-    return '/tmp/{}'.format(image_info['id'])
+    return '/tmp/{}{}'.format(prefix, image_info['id'])
 
 
 def _path_to_script(script):
@@ -172,7 +185,7 @@ def _message_format(msg, image_info, device, partition_uuids):
     return message
 
 
-class ImageDownload(object):
+class HTTPImageDownload(object):
     """Helper class that opens a HTTP connection to download an image.
 
     This class opens a HTTP connection to download an image from a URL
@@ -180,8 +193,8 @@ class ImageDownload(object):
     MD5 hash of the image being downloaded is calculated on-the-fly.
     """
 
-    def __init__(self, image_info, time_obj=None):
-        """Initialize an instance of the ImageDownload class.
+    def __init__(self, image_info, image_location, time_obj=None):
+        """Initialize an instance of the HTTPImageDownload class.
 
         Trys each URL in image_info successively until a URL returns a
         successful request code. Once the object is initialized, the user may
@@ -190,6 +203,7 @@ class ImageDownload(object):
         encountered.
 
         :param image_info: Image information dictionary.
+        :param image_location:
         :param time_obj: Optional time object to indicate when the image
                          download began. Defaults to None. If None, then
                          time.time() will be used to find the start time of
@@ -220,6 +234,21 @@ class ImageDownload(object):
             details = '\n '.join(details)
             raise errors.ImageDownloadError(image_info['id'], details)
 
+        with open(image_location, 'wb+') as f:
+            try:
+                for chunk in self._request.iter_content(IMAGE_CHUNK_SIZE):
+                    self._md5checksum.update(chunk)
+                    f.write(chunk)
+            except Exception as e:
+                msg = 'Unable to write image to {}. Error: {}'.format(
+                    image_location, str(e))
+                raise errors.ImageDownloadError(image_info['id'], msg)
+
+        totaltime = time.time() - time_obj
+        LOG.info("Image downloaded from {} in {} "
+                 "seconds".format(image_location, totaltime))
+        self._verify_image(image_info, image_location, self.md5sum())
+
     def _download_file(self, image_info, url):
         """Opens a download stream for the given URL.
 
@@ -241,6 +270,28 @@ class ImageDownload(object):
                    'body: {}').format(resp.status_code, url, resp.text)
             raise errors.ImageDownloadError(image_info['id'], msg)
         return resp
+
+    def _verify_image(self, image_info, image_location, checksum):
+        """Verifies the checksum of the local images matches expectations.
+
+        If this function does not raise ImageChecksumError then it is very
+        likely that the local copy of the image was transmitted and stored
+        correctly.
+
+        :param image_info: Image information dictionary.
+        :param image_location: The location of the local image.
+        :param checksum: The computed checksum of the local image.
+        :raises: ImageChecksumError if the checksum of the local image does
+                 not match the checksum as reported by glance in image_info.
+        """
+        LOG.debug('Verifying image at {} against MD5 checksum '
+                  '{}'.format(image_location, checksum))
+        if checksum != image_info['checksum']:
+            LOG.error(errors.ImageChecksumError.details_str.format(
+                image_location, image_info['id'],
+                image_info['checksum'], checksum))
+            raise errors.ImageChecksumError(image_location, image_info['id'],
+                                            image_info['checksum'], checksum)
 
     def __iter__(self):
         """Downloads and returns the next chunk of the image.
@@ -264,26 +315,72 @@ class ImageDownload(object):
         return self._md5checksum.hexdigest()
 
 
-def _verify_image(image_info, image_location, checksum):
-    """Verifies the checksum of the local images matches expectations.
+class BitTorrentImageDownload(object):
+    """Helper class that opens a HTTP connection to download an image.
 
-    If this function does not raise ImageChecksumError then it is very likely
-    that the local copy of the image was transmitted and stored correctly.
+    """
+
+    def __init__(self, image_info, image_location, time_obj=None):
+        """Initialize an instance of the BitTorrentImageDownload class.
+
+        """
+
+        LOG.info("Attempting to download image with torrent %s", image_info)
+
+        torrent_info = image_info['torrent']['info']
+        torrent_file_location = _image_location(torrent_info, 'torrent_')
+        HTTPImageDownload(torrent_info, torrent_file_location,
+                          time_obj=time_obj)
+
+        orig_torrent = bcoding.bdecode(
+            open(torrent_file_location, 'rb').read())
+        new_torrent = {
+            'info': {'name': image_info['id'],
+                     'length': orig_torrent['info']['length'],
+                     'piece length': orig_torrent['info']['piece length'],
+                     'pieces': orig_torrent['info']['pieces']},
+            'url-list': image_info['urls']}
+
+        open(torrent_file_location, 'wb').write(bcoding.bencode(new_torrent))
+
+        is_blk_device = (os.path.exists(image_location) and
+                         stat.S_ISBLK(os.stat(image_location).st_mode))
+
+        if is_blk_device:
+            LOG.debug('Stream image {} to device {}'.format(image_info['id'],
+                                                            image_location))
+            os.symlink(image_location, _image_location(image_info))
+
+        # TODO(aarefiev): get dir from image_location, add configuration
+        command = ['aria2c', '--console-log-level=warn',
+                   '--check-certificate=false', '--file-allocation=none',
+                   '--allow-overwrite=true', '--seed-ratio=0.0',
+                   '--bt-tracker-interval=2', '--enable-dht=false',
+                   '--enable-dht6=false', '--disable-ipv6=true',
+                   '--enable-peer-exchange=true', '--bt-enable-lpd=true',
+                   '--follow-torrent=mem', '--dir=/tmp',
+                   '--bt-tracker-connect-timeout=2',
+                   '--bt-tracker-timeout=5', '--seed-time=0',
+                   '--bt-tracker=%s' % image_info['torrent']['trackers'],
+                   torrent_file_location]
+        LOG.debug('Downloading image with command:')
+        try:
+            _, _ = utils.execute(*command, check_exit_code=[0])
+        except processutils.ProcessExecutionError as e:
+            raise errors.ImageDownloadError(image_info['id'], e)
+
+        totaltime = time.time() - time_obj
+        LOG.info("Image downloaded in {0} seconds".format(totaltime))
+
+
+def _get_image_downloader(image_info):
+    """Help method for image download
 
     :param image_info: Image information dictionary.
-    :param image_location: The location of the local image.
-    :param checksum: The computed checksum of the local image.
-    :raises: ImageChecksumError if the checksum of the local image does not
-             match the checksum as reported by glance in image_info.
+    :return: image downloader object
     """
-    LOG.debug('Verifying image at {} against MD5 checksum '
-              '{}'.format(image_location, checksum))
-    if checksum != image_info['checksum']:
-        LOG.error(errors.ImageChecksumError.details_str.format(
-            image_location, image_info['id'],
-            image_info['checksum'], checksum))
-        raise errors.ImageChecksumError(image_location, image_info['id'],
-                                        image_info['checksum'], checksum)
+    torrent_file = image_info.get('torrent')
+    return BitTorrentImageDownload if torrent_file else HTTPImageDownload
 
 
 def _download_image(image_info):
@@ -294,23 +391,11 @@ def _download_image(image_info):
     :raises: ImageChecksumError if the downloaded image's checksum does not
              match the one reported in image_info.
     """
+
     starttime = time.time()
     image_location = _image_location(image_info)
-    image_download = ImageDownload(image_info, time_obj=starttime)
-
-    with open(image_location, 'wb') as f:
-        try:
-            for chunk in image_download:
-                f.write(chunk)
-        except Exception as e:
-            msg = 'Unable to write image to {}. Error: {}'.format(
-                image_location, str(e))
-            raise errors.ImageDownloadError(image_info['id'], msg)
-
-    totaltime = time.time() - starttime
-    LOG.info("Image downloaded from {} in {} seconds".format(image_location,
-                                                             totaltime))
-    _verify_image(image_info, image_location, image_download.md5sum())
+    downloader = _get_image_downloader(image_info)
+    downloader(image_info, image_location, time_obj=starttime)
 
 
 def _validate_image_info(ext, image_info=None, **kwargs):
@@ -382,22 +467,8 @@ class StandbyExtension(base.BaseAgentExtension):
              match the checksum as reported by glance in image_info.
         """
         starttime = time.time()
-        image_download = ImageDownload(image_info, time_obj=starttime)
-
-        with open(device, 'wb+') as f:
-            try:
-                for chunk in image_download:
-                    f.write(chunk)
-            except Exception as e:
-                msg = 'Unable to write image to device {}. Error: {}'.format(
-                      device, str(e))
-                raise errors.ImageDownloadError(image_info['id'], msg)
-
-        totaltime = time.time() - starttime
-        LOG.info("Image streamed onto device {} in {} "
-                 "seconds".format(device, totaltime))
-        # Verify if the checksum of the streamed image is correct
-        _verify_image(image_info, device, image_download.md5sum())
+        downloader = _get_image_downloader(image_info)
+        downloader(image_info, device, time_obj=starttime)
 
     @base.async_command('cache_image', _validate_image_info)
     def cache_image(self, image_info=None, force=False):
@@ -465,8 +536,9 @@ class StandbyExtension(base.BaseAgentExtension):
                 LOG.debug('Already had %s cached, overwriting',
                           self.cached_image_id)
 
-            if (stream_raw_images and disk_format == 'raw'
-                    and image_info.get('image_type') != 'partition'):
+            # TODO(aarefiev): move this to HTTPDownloader
+            if (stream_raw_images and disk_format == 'raw' and
+                image_info.get('image_type') != 'partition'):
                 self._stream_raw_image_onto_device(image_info, device)
             else:
                 self._cache_and_write_image(image_info, device)
